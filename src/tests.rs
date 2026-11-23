@@ -65,6 +65,53 @@ fn test_multi_record_log_simple() {
 }
 
 #[test]
+fn test_multi_record_log_mixed_raw_and_compressed_reopen() {
+    let tempdir = tempfile::tempdir().unwrap();
+    // Large, repetitive payload: above MIN_COMPRESS_LEN and highly compressible.
+    let large_payload: Vec<u8> = b"otel-log-line\n".iter().copied().cycle().take(256 * 1024).collect();
+    // Phase 1: records written the way the old (uncompressed) format did.
+    {
+        let mut multi_record_log = MultiRecordLog::open(tempdir.path()).unwrap();
+        multi_record_log.create_queue("queue").unwrap();
+        multi_record_log
+            .append_record("queue", None, &b"raw-1"[..])
+            .unwrap();
+        multi_record_log
+            .append_record("queue", None, &b"raw-2"[..])
+            .unwrap();
+    }
+    // Phase 2: reopened; the large record must go to disk compressed, the small one raw.
+    {
+        let mut multi_record_log = MultiRecordLog::open(tempdir.path()).unwrap();
+        let outcome = multi_record_log
+            .append_record("queue", None, large_payload.as_slice())
+            .unwrap();
+        assert!(
+            (outcome.wal_bytes_written as usize) < large_payload.len(),
+            "the large record must be stored compressed ({} WAL bytes for {} payload bytes)",
+            outcome.wal_bytes_written,
+            large_payload.len()
+        );
+        multi_record_log
+            .append_record("queue", None, &b"raw-3"[..])
+            .unwrap();
+    }
+    // Phase 3: replay a directory that mixes raw and compressed frames.
+    {
+        let multi_record_log = MultiRecordLog::open(tempdir.path()).unwrap();
+        assert_eq!(
+            &read_all_records(&multi_record_log, "queue"),
+            &[
+                b"raw-1".as_slice(),
+                b"raw-2".as_slice(),
+                large_payload.as_slice(),
+                b"raw-3".as_slice(),
+            ]
+        );
+    }
+}
+
+#[test]
 fn test_multi_record_log_chained() {
     let tempdir = tempfile::tempdir().unwrap();
     {

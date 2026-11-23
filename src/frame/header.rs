@@ -71,6 +71,15 @@ pub enum FrameType {
     First = 2u8,
     Middle = 3u8,
     Last = 4u8,
+    /// Like [`FrameType::Full`], but the reassembled record payload is zstd-compressed.
+    ///
+    /// Uses a new code (5) rather than reusing `Full`, so an older binary that does not know it
+    /// treats the header as corruption and drops the block instead of misparsing compressed bytes
+    /// as a record. `Middle`/`Last` are shared with the uncompressed case; the reader learns a
+    /// record is compressed from its first frame.
+    FullCompressed = 5u8,
+    /// Like [`FrameType::First`], but the reassembled record payload is zstd-compressed.
+    FirstCompressed = 6u8,
 }
 
 impl FrameType {
@@ -80,6 +89,8 @@ impl FrameType {
             2u8 => Some(FrameType::First),
             3u8 => Some(FrameType::Middle),
             4u8 => Some(FrameType::Last),
+            5u8 => Some(FrameType::FullCompressed),
+            6u8 => Some(FrameType::FirstCompressed),
             _ => None,
         }
     }
@@ -90,16 +101,28 @@ impl FrameType {
 
     pub fn is_first_frame_of_record(&self) -> bool {
         match self {
-            FrameType::Full | FrameType::First => true,
+            FrameType::Full
+            | FrameType::First
+            | FrameType::FullCompressed
+            | FrameType::FirstCompressed => true,
             FrameType::Last | FrameType::Middle => false,
         }
     }
 
     pub fn is_last_frame_of_record(&self) -> bool {
         match self {
-            FrameType::Full | FrameType::Last => true,
-            FrameType::First | FrameType::Middle => false,
+            FrameType::Full | FrameType::Last | FrameType::FullCompressed => true,
+            FrameType::First | FrameType::Middle | FrameType::FirstCompressed => false,
         }
+    }
+
+    /// True when this is the first frame of a record whose reassembled payload is
+    /// zstd-compressed (and must be decompressed before deserialization).
+    pub fn is_compressed_first_frame(&self) -> bool {
+        matches!(
+            self,
+            FrameType::FullCompressed | FrameType::FirstCompressed
+        )
     }
 }
 
@@ -110,11 +133,13 @@ mod tests {
 
     #[test]
     fn test_frame_type_serialize_deserialize() {
-        const ALL_FRAME_TYPES: [FrameType; 4] = [
+        const ALL_FRAME_TYPES: [FrameType; 6] = [
             FrameType::Full,
             FrameType::First,
             FrameType::Middle,
             FrameType::Last,
+            FrameType::FullCompressed,
+            FrameType::FirstCompressed,
         ];
         for frame_type in ALL_FRAME_TYPES {
             assert_eq!(FrameType::from_u8(frame_type.to_u8()), Some(frame_type));
@@ -124,6 +149,28 @@ mod tests {
     #[test]
     fn test_frame_deserialize_invalid() {
         assert_eq!(FrameType::from_u8(14u8), None);
+    }
+
+    #[test]
+    fn test_compressed_frame_type_classification() {
+        assert!(FrameType::FullCompressed.is_first_frame_of_record());
+        assert!(FrameType::FullCompressed.is_last_frame_of_record());
+        assert!(FrameType::FullCompressed.is_compressed_first_frame());
+
+        assert!(FrameType::FirstCompressed.is_first_frame_of_record());
+        assert!(!FrameType::FirstCompressed.is_last_frame_of_record());
+        assert!(FrameType::FirstCompressed.is_compressed_first_frame());
+
+        // The non-first frames of a compressed record reuse the plain codes.
+        assert!(!FrameType::Middle.is_first_frame_of_record());
+        assert!(!FrameType::Middle.is_last_frame_of_record());
+        assert!(!FrameType::Middle.is_compressed_first_frame());
+        assert!(!FrameType::Last.is_first_frame_of_record());
+        assert!(FrameType::Last.is_last_frame_of_record());
+        assert!(!FrameType::Last.is_compressed_first_frame());
+
+        assert!(!FrameType::Full.is_compressed_first_frame());
+        assert!(!FrameType::First.is_compressed_first_frame());
     }
 
     #[test]
