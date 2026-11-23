@@ -6,9 +6,21 @@ use crate::recordlog::RecordWriter;
 use crate::rolling::{RollingReader, RollingWriter};
 use crate::{BlockRead, Serializable};
 
+/// Upper bound on the size a compressed record may decompress to. Compressed payloads are
+/// CRC-checked per frame before decompression, so this only bounds the allocation a corrupt (but
+/// CRC-valid) frame could request; it sits comfortably above the default ingest
+/// `max_decompressed_body_size` (256 MiB).
+const MAX_DECOMPRESSED_RECORD_BYTES: u64 = 512 * 1024 * 1024;
+
 pub struct RecordReader<R> {
     frame_reader: FrameReader<R>,
     record_buffer: Vec<u8>,
+    /// Holds the decompressed form of the last reassembled record when it was compressed. Left
+    /// empty for uncompressed records.
+    decompressed_buffer: Vec<u8>,
+    /// True when the record currently in `record_buffer` is zstd-compressed and must be read
+    /// through `decompressed_buffer`.
+    record_compressed: bool,
     // true if we are in the middle of reading a multifragment record.
     // This is useful, as it makes it possible to drop a record
     // if one of its fragment was corrupted.
@@ -21,6 +33,8 @@ impl<R: BlockRead + Unpin> RecordReader<R> {
         RecordReader {
             frame_reader,
             record_buffer: Vec::with_capacity(10_000),
+            decompressed_buffer: Vec::new(),
+            record_compressed: false,
             within_record: false,
         }
     }
@@ -31,7 +45,11 @@ impl<R: BlockRead + Unpin> RecordReader<R> {
 
     /// Deserialize a record without actually consuming data.
     pub fn record<'a, S: Serializable<'a>>(&'a self) -> Option<S> {
-        S::deserialize(&self.record_buffer)
+        if self.record_compressed {
+            S::deserialize(&self.decompressed_buffer)
+        } else {
+            S::deserialize(&self.record_buffer)
+        }
     }
 
     /// Advance cursor and deserialize the next record.
@@ -57,11 +75,15 @@ impl<R: BlockRead + Unpin> RecordReader<R> {
                     if frame_type.is_first_frame_of_record() {
                         self.within_record = true;
                         self.record_buffer.clear();
+                        self.record_compressed = frame_type.is_compressed_first_frame();
                     }
                     if self.within_record {
                         self.record_buffer.extend_from_slice(frame_payload);
                         if frame_type.is_last_frame_of_record() {
                             self.within_record = false;
+                            if self.record_compressed {
+                                self.decompress_current_record()?;
+                            }
                             return Ok(true);
                         }
                     }
@@ -79,6 +101,22 @@ impl<R: BlockRead + Unpin> RecordReader<R> {
                 }
             }
         }
+    }
+
+    /// Decompress the reassembled `record_buffer` into `decompressed_buffer`. A blob whose zstd
+    /// content size is missing, or above [`MAX_DECOMPRESSED_RECORD_BYTES`], or that fails to
+    /// decompress, is reported as `Corruption` so the caller drops the record exactly like a
+    /// failed frame CRC.
+    fn decompress_current_record(&mut self) -> Result<(), ReadRecordError> {
+        let decompressed_size = zstd::decompressed_size(&self.record_buffer)
+            .ok_or(ReadRecordError::Corruption)?;
+        if decompressed_size > MAX_DECOMPRESSED_RECORD_BYTES {
+            return Err(ReadRecordError::Corruption);
+        }
+        self.decompressed_buffer =
+            zstd::bulk::decompress(&self.record_buffer, decompressed_size as usize)
+                .map_err(|_| ReadRecordError::Corruption)?;
+        Ok(())
     }
 }
 
